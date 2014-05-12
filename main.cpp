@@ -4,26 +4,58 @@
 #include <stdio.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <fcntl.h>
 
 #include <map>
 #include <string>
 
+#define _I(x) std::make_pair(x, #x)
+std::map <int, std::string> open_modes
+{
+    _I(O_RDONLY),
+    _I(O_WRONLY),
+    _I(O_RDWR),
+    _I(O_CREAT),
+    _I(O_APPEND),
+    _I(O_ASYNC),
+    _I(O_CLOEXEC),
+    _I(O_DIRECT),
+    _I(O_DIRECTORY),
+    _I(O_EXCL),
+    _I(O_LARGEFILE),
+    _I(O_NOATIME),
+    _I(O_NOCTTY),
+    _I(O_NOFOLLOW),
+    _I(O_NONBLOCK),
+    _I(O_NDELAY),
+    _I(O_PATH),
+    _I(O_SYNC),
+    _I(O_TRUNC),
+};
+#undef _I
+
 char *copybuf;
 size_t copybuf_len;
 pid_t pid;
+std::map<int, std::string> fds;
 
 typedef void (*syscall_handler)(struct user_regs_struct *);
 
 /* Dumps buffers in a manner similar to "hd" on linux */
-void hexdump8(char *buf, size_t cnt) {
+void hexdump8(const char *tag, const char *buf, size_t cnt) {
     size_t i = 0;
     while (i < cnt) {
+        if (tag) {
+            printf("%s", tag);
+        }
+
         printf("%08zX  ", i);
         
         // Print the hex first
@@ -60,7 +92,11 @@ void hexdump8(char *buf, size_t cnt) {
     }
 }
 
-void copy_data_from_child(uintptr_t addr, size_t cnt) {
+void hexdump8(char *buf, size_t cnt) {
+    hexdump8(NULL, buf, cnt);
+}
+
+char *copy_data_from_child(uintptr_t addr, size_t cnt) {
     uint32_t tmp;
 
     for (size_t i = 0; i < cnt; i += 4) {
@@ -72,9 +108,11 @@ void copy_data_from_child(uintptr_t addr, size_t cnt) {
         tmp = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
         memcpy(copybuf + i, (void *) &tmp, sizeof(tmp));
     }
+
+    return copybuf;
 }
 
-void copy_string_from_child(uintptr_t addr) {
+char *copy_string_from_child(uintptr_t addr) {
     uint32_t tmp, cnt = 0;
 
     while (1) {
@@ -90,30 +128,66 @@ void copy_string_from_child(uintptr_t addr) {
         }
         cnt += 4;
     }
+
+    return copybuf;
 }
 
 void handle_open(struct user_regs_struct *regs) {
-    copy_string_from_child(regs->rdi);
+    const char *path = copy_string_from_child(regs->rdi);
+    uint64_t mode = regs->rsi;
+    int64_t ret = regs->rax;
+    std::string mode_str;
     
-    printf("open(\"%s\", %u, %u) = %d\n", (const char *) copybuf, regs->rsi, regs->rdx, regs->rax);
+    /* Open has a number of mode flags that can be checked 
+     * bitwise, however O_RDONLY is mapped to 0x0. So we need
+     * to check whether the mutually exclusive O_WRONLY or O_RDWR
+     * are set to decide whether we should assume O_RDONLY is in play
+     */
+    if (!(mode & O_WRONLY) && !(mode & O_RDWR))
+        mode_str += "O_RDONLY";
+
+    for (auto& m : open_modes) {
+        if (mode & m.first) {
+            if (mode_str != "")
+                mode_str += " | ";
+            mode_str += m.second;
+        }
+    }
+
+
+    printf("open(\"%s\", 0x%08lx '%s') = %ld\n", path, mode, mode_str.c_str(), ret);
+    fds[ret] = std::string(path);
 }
 
 void handle_close(struct user_regs_struct *regs) {
-    printf("close(%d) = %d\n", regs->rdi, regs->rax);
+    int64_t fd = regs->rdi;
+    int64_t ret = regs->rax;
+
+    printf("close(%ld '%s') = %ld\n", fd, fds[fd].c_str(), ret);
+
+    if (fd >= 0 && fd <= 2) {
+        fds.erase(fd);
+    }
 }
 
 void handle_read(struct user_regs_struct *regs) {
-    copy_data_from_child(regs->rsi, regs->rdx);
+    int64_t fd = regs->rdi;
+    uintptr_t buf = regs->rsi;
+    uint64_t len = regs->rdx;
+    int64_t ret = regs->rax;
 
-    printf("read(%d, 0x%08X, %zu) = %d\n", regs->rdi, regs->rsi, regs->rdx, regs->rax);
-    hexdump8(copybuf, regs->rax);
+    printf("read(%ld '%s', 0x%016llx, %lu) = %ld\n", fd, fds[fd].c_str(), regs->rsi, len, ret);
+    hexdump8("read: ", copy_data_from_child(buf, len), ret);
 }
 
 void handle_write(struct user_regs_struct *regs) {
-    copy_data_from_child(regs->rsi, regs->rdx);
+    int64_t fd = regs->rdi;
+    uintptr_t buf = regs->rsi;
+    uint64_t len = regs->rdx;
+    int64_t ret = regs->rax;
 
-    printf("write(%d, 0x%08X, %zu) = %d\n", regs->rdi, regs->rsi, regs->rdx, regs->rax);
-    hexdump8(copybuf, regs->rax);
+    printf("write(%ld \"%s\", 0x%016llx, %lu) = %ld\n", fd, fds[fd].c_str(), regs->rsi, len, ret);
+    hexdump8("write: ", copy_data_from_child(buf, ret), ret);
 }
 
 
@@ -125,6 +199,11 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2)
         return -1;
+
+    // These are often referenced by number rather than name, so map them ahead of time
+    fds[0] = std::string("STDIN");
+    fds[1] = std::string("STDOUT");
+    fds[2] = std::string("STDERR");
 
     // Set up the syscall mappings to handlers that we care about
     handles[SYS_open] = handle_open;
@@ -141,7 +220,6 @@ int main(int argc, char *argv[]) {
         ptrace(PTRACE_TRACEME, pid, NULL, NULL);
         execvp(argv[1], argv + 1);
     } else {
-
         while (1) {
             wait(&status);
             if (WIFEXITED(status))
