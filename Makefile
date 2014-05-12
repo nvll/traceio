@@ -1,5 +1,13 @@
+CXX := g++
+OUTPUT := traceio
+CXXFLAGS := -std=c++11
+SRCS := \
+	main.cpp \
+	flag_maps.cpp
+OBJS := $(SRCS:.cpp=.o)
+
 all:
-	g++ -std=c++11 main.cpp -o iocreep
+	$(CXX) $(CXXFLAGS) $(SRCS) -o $(OUTPUT)
 
 clean:
-	rm -f iocreep main.o
+	rm -f $(OUTPUT) $(OBJS)

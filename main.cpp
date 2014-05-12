@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -16,30 +17,7 @@
 #include <map>
 #include <string>
 
-#define _I(x) std::make_pair(x, #x)
-std::map <int, std::string> open_modes
-{
-    _I(O_RDONLY),
-    _I(O_WRONLY),
-    _I(O_RDWR),
-    _I(O_CREAT),
-    _I(O_APPEND),
-    _I(O_ASYNC),
-    _I(O_CLOEXEC),
-    _I(O_DIRECT),
-    _I(O_DIRECTORY),
-    _I(O_EXCL),
-    _I(O_LARGEFILE),
-    _I(O_NOATIME),
-    _I(O_NOCTTY),
-    _I(O_NOFOLLOW),
-    _I(O_NONBLOCK),
-    _I(O_NDELAY),
-    _I(O_PATH),
-    _I(O_SYNC),
-    _I(O_TRUNC),
-};
-#undef _I
+#include "flag_maps.hpp"
 
 char *copybuf;
 size_t copybuf_len;
@@ -47,6 +25,18 @@ pid_t pid;
 std::map<int, std::string> fds;
 
 typedef void (*syscall_handler)(struct user_regs_struct *);
+
+void map_flags(uint64_t flags, std::map<int, std::string>& map, std::string& str) {
+    for (auto& m : map) {
+        if (flags & m.first) {
+            if (str != "") {
+                str += " | ";
+            }
+
+            str += m.second;
+        }
+    }
+}
 
 /* Dumps buffers in a manner similar to "hd" on linux */
 void hexdump8(const char *tag, const char *buf, size_t cnt) {
@@ -132,6 +122,9 @@ char *copy_string_from_child(uintptr_t addr) {
     return copybuf;
 }
 
+void handle_creat(struct user_regs_struct *regs) {
+}
+
 void handle_open(struct user_regs_struct *regs) {
     const char *path = copy_string_from_child(regs->rdi);
     uint64_t mode = regs->rsi;
@@ -146,14 +139,7 @@ void handle_open(struct user_regs_struct *regs) {
     if (!(mode & O_WRONLY) && !(mode & O_RDWR))
         mode_str += "O_RDONLY";
 
-    for (auto& m : open_modes) {
-        if (mode & m.first) {
-            if (mode_str != "")
-                mode_str += " | ";
-            mode_str += m.second;
-        }
-    }
-
+    map_flags(mode, open_modes, mode_str);
 
     printf("open(\"%s\", 0x%08lx '%s') = %ld\n", path, mode, mode_str.c_str(), ret);
     fds[ret] = std::string(path);
@@ -190,12 +176,36 @@ void handle_write(struct user_regs_struct *regs) {
     hexdump8("write: ", copy_data_from_child(buf, ret), ret);
 }
 
+void handle_mmap(struct user_regs_struct *regs) {
+    uintptr_t addr = regs->rdi;
+    uint64_t length = regs->rsi;
+    int64_t prot = regs->rdx;
+    int64_t flags = regs->r10;
+    int64_t fd = (flags & MAP_ANONYMOUS) ? -1 : regs->r8;
+    off_t offset = regs->r9;
+    uintptr_t ret = regs->rax;
+    std::string flags_str;
+    std::string prot_str;
+    
+    map_flags(flags, mmap_flags, flags_str);
+    map_flags(prot, mmap_prot, prot_str);
+    printf("mmap(0x%016llx, %lu, 0x%08lx '%s', 0x%08lx '%s', %ld, %ld) = 0x%016lx\n",
+        addr, length, prot, prot_str.c_str(), flags, flags_str.c_str(), fd, offset, ret);
+}
 
+void handle_unhandled_syscall(struct user_regs_struct *regs) {
+    int64_t syscall = regs->orig_rax;
+    uint64_t ret = regs->rax;
+    printf("%s(...?) = 0x%016lx\n", syscall_map[syscall].c_str(), ret);
+}
+    
 int main(int argc, char *argv[]) {
     int status;
     bool in_call = false;
     struct user_regs_struct regs, tmp_regs;
     std::map<int, syscall_handler> handles;
+    bool show_unhandled_syscalls = getenv("SHOW_UNHANDLED_SYSCALLS");
+    int64_t current_syscall;
 
     if (argc < 2)
         return -1;
@@ -210,6 +220,7 @@ int main(int argc, char *argv[]) {
     handles[SYS_close] = handle_close;
     handles[SYS_read] = handle_read;
     handles[SYS_write] = handle_write;
+    handles[SYS_mmap] = handle_mmap;
 
     // Any copy from the child process is stored here
     copybuf_len = 32;
@@ -231,15 +242,17 @@ int main(int argc, char *argv[]) {
              * information.
              */
             ptrace(PTRACE_GETREGS, pid, NULL, &tmp_regs);
-            if (handles[tmp_regs.orig_rax] != NULL) {
-                if (!in_call) {
-                    regs = tmp_regs;
-                    in_call = true;
-                } else {
-                    regs.rax = tmp_regs.rax;
-                    in_call = false;
+            if (!in_call) {
+                regs = tmp_regs;
+                in_call = true;
+                
+            } else {
+                in_call = false;
 
-                    handles[tmp_regs.orig_rax](&regs);
+                if (handles[regs.orig_rax]) {
+                    handles[regs.orig_rax](&regs);
+                } else if (show_unhandled_syscalls) {
+                    handle_unhandled_syscall(&regs);
                 }
             }
             ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
